@@ -14,7 +14,6 @@ export const uploadToStreamtape = async (buffer, filename) => {
         params: {
           login: process.env.STREAMTAPE_LOGIN,
           key: process.env.STREAMTAPE_KEY,
-          httponly: 0,
         },
       }
     );
