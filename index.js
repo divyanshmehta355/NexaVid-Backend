@@ -10,10 +10,10 @@ const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const axios = require("axios"); // For making HTTP requests to Streamtape API
-const multer = require("multer"); // For handling file uploads (multipart/form-data)
 // const path = require('path'); // Not needed if not serving static files from backend
 const morgan = require("morgan");
 const expressStatusMonitor = require("express-status-monitor");
+const Busboy = require("busboy"); // NEW: Import Busboy for stream parsing
 
 const app = express();
 // Use process.env.PORT for Render deployment, fallback to 5000 for local dev
@@ -96,15 +96,6 @@ if (!STREAMTAPE_LOGIN || !STREAMTAPE_KEY || !STREAMTAPE_FOLDER_ID) {
 }
 
 const API_BASE_URL = "https://api.streamtape.com";
-
-// 6. Multer Configuration for File Uploads
-// Stores the file in memory as a buffer. Limits to 1GB by default.
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 1024 * 1024 * 15000, // 1GB limit (adjust as needed, check Streamtape limits)
-  },
-});
 
 // 7. Backend API Routes
 
@@ -245,115 +236,164 @@ app.get("/api/videos/:linkId/download-link", async (req, res) => {
   }
 });
 
-// Route: Handle video uploads to Streamtape
-app.post("/api/upload", upload.single("videoFile"), async (req, res) => {
-  // 'videoFile' is the name of the field in the FormData sent from the frontend
-  // Ensure you have added 'axios', 'multer', 'form-data', 'https', 'dns' to your package.json dependencies
+// NEW: Handle video uploads to Streamtape using Busboy for direct streaming
+app.post("/api/upload", (req, res) => {
+  const busboy = Busboy({
+    headers: req.headers,
+    highWaterMark: 2 * 1024 * 1024,
+  }); // 2MB chunk size
 
-  if (!req.file) {
-    return res
-      .status(400)
-      .json({ success: false, message: "No file uploaded." });
-  }
+  let fileStream;
+  let fileName = "unknown_file"; // Default filename if not provided by client
 
-  const buffer = req.file.buffer;
-  const filename = req.file.originalname;
-
-  try {
-    // These are required inside the function due to being CommonJS and potentially large
-    const FormData = require("form-data");
-    const https = require("https");
-    const dns = require("dns");
-
-    dns.setDefaultResultOrder("ipv4first"); // Ensure this is set for DNS resolution
-
-    // Step 1: Get an upload URL from Streamtape
-    const initResponse = await axios.get(`${API_BASE_URL}/file/ul`, {
-      params: {
-        login: STREAMTAPE_LOGIN,
-        key: STREAMTAPE_KEY,
-        folder: STREAMTAPE_FOLDER_ID,
-      },
-    });
-
-    if (initResponse.data.status !== 200 || !initResponse.data.result?.url) {
-      throw new Error(
-        initResponse.data.msg || "Failed to get upload URL from Streamtape."
-      );
+  // Parse file part
+  busboy.on("file", (fieldname, file, filename, encoding, mimetype) => {
+    if (fieldname !== "videoFile") {
+      // Ensure it's the field we expect
+      file.resume(); // Ignore other fields
+      return;
     }
 
-    const uploadUrl = initResponse.data.result.url;
+    console.log(`Receiving file: ${filename.filename} (${mimetype})`);
+    fileName = filename.filename || "uploaded_video";
+    fileStream = file; // Store the file stream
 
-    // Step 2: Prepare the file for upload
-    const form = new FormData();
-    form.append("file1", buffer, {
-      filename: filename,
-      contentType: req.file.mimetype || "application/octet-stream", // Use actual mimetype
+    // Error handling for the incoming file stream
+    file.on("error", (err) => {
+      console.error("Error on file stream:", err);
+      if (!res.headersSent) {
+        return res.status(500).json({
+          success: false,
+          message: "File stream error during upload.",
+        });
+      }
     });
+  });
 
-    // Ensure proper agent for HTTPS to force IPv4
-    const agent = new https.Agent({
-      keepAlive: true,
-      family: 4,
-    });
+  // Parse non-file fields (if any, though not strictly needed for current frontend)
+  busboy.on(
+    "field",
+    (fieldname, val, fieldnameTruncated, valTruncated, encoding, mimetype) => {
+      // console.log(`Field [${fieldname}]: value: ${val}`);
+      // You could capture other form fields here if your frontend sends them
+    }
+  );
 
-    // Step 3: Perform the actual upload
-    const uploadResponse = await axios.post(uploadUrl, form, {
-      headers: form.getHeaders(),
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      httpsAgent: agent,
-    });
-
-    if (uploadResponse.data.status !== 200 || !uploadResponse.data.result?.id) {
-      throw new Error(
-        uploadResponse.data.msg ||
-          "Upload failed or no file ID returned from Streamtape."
-      );
+  busboy.on("finish", async () => {
+    if (!fileStream) {
+      console.warn("No file stream found in upload request.");
+      if (!res.headersSent) {
+        return res
+          .status(400)
+          .json({ success: false, message: "No file uploaded." });
+      }
     }
 
-    const result = uploadResponse.data.result;
+    try {
+      const FormData = require("form-data");
+      const https = require("https");
+      const dns = require("dns");
+      dns.setDefaultResultOrder("ipv4first");
 
-    // Optional: Save file metadata to your MongoDB database here
-    // if (Video) { // Check if Video model is defined and import it if needed
-    //     const newVideo = new Video({
-    //         fileId: result.id,
-    //         fileName: result.name,
-    //         streamUrl: `https://streamtape.com/e/${result.id}`,
-    //         downloadUrl: result.url,
-    //         size: result.size,
-    //         contentType: result.content_type,
-    //         uploadedAt: new Date(),
-    //         // ... other fields you might want to save
-    //     });
-    //     await newVideo.save();
-    // }
+      // Step 1: Get an upload URL from Streamtape
+      const initResponse = await axios.get(`${API_BASE_URL}/file/ul`, {
+        params: {
+          login: STREAMTAPE_LOGIN,
+          key: STREAMTAPE_KEY,
+          folder: STREAMTAPE_FOLDER_ID,
+        },
+      });
 
-    res.status(200).json({
-      success: true,
-      message: "Video uploaded successfully!",
-      data: {
-        fileId: result.id,
-        fileName: result.name,
-        streamUrl: `https://streamtape.com/e/${result.id}`,
-        downloadUrl: result.url,
-        size: result.size,
-        contentType: result.content_type,
-        sha256: result.sha256,
-      },
-    });
-  } catch (error) {
-    console.error(
-      "Error in /api/upload route:",
-      error.response?.data || error.message
-    );
-    res.status(500).json({
-      success: false,
-      message: `Failed to upload video: ${
-        error.response?.data?.msg || error.message
-      }`,
-    });
-  }
+      if (initResponse.data.status !== 200 || !initResponse.data.result?.url) {
+        throw new Error(
+          initResponse.data.msg || "Failed to get upload URL from Streamtape."
+        );
+      }
+
+      const uploadUrl = initResponse.data.result.url;
+      console.log(`Streamtape upload URL obtained: ${uploadUrl}`);
+
+      // Step 2: Prepare the file for upload via Form-data and pipe the stream
+      const form = new FormData();
+      form.append("file1", fileStream, {
+        // Append the stream directly
+        filename: fileName, // Use the captured filename
+        contentType: "application/octet-stream", // Let Streamtape detect or set appropriately
+      });
+
+      const agent = new https.Agent({
+        keepAlive: true,
+        family: 4,
+      });
+
+      // Step 3: Perform the actual upload using axios and the form-data stream
+      const uploadResponse = await axios.post(uploadUrl, form, {
+        headers: form.getHeaders(), // Important: Axios needs these headers for stream
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        httpsAgent: agent,
+        onUploadProgress: (progressEvent) => {
+          const percentCompleted = Math.round(
+            (progressEvent.loaded * 100) / progressEvent.total
+          );
+          // You can send progress updates to the client via WebSockets if desired
+          // For now, it's just logged on the server.
+          if (percentCompleted % 10 === 0) {
+            // Log every 10%
+            console.log(
+              `Upload progress for ${fileName}: ${percentCompleted}%`
+            );
+          }
+        },
+      });
+
+      if (
+        uploadResponse.data.status !== 200 ||
+        !uploadResponse.data.result?.id
+      ) {
+        throw new Error(
+          uploadResponse.data.msg ||
+            "Upload failed or no file ID returned from Streamtape."
+        );
+      }
+
+      const result = uploadResponse.data.result;
+      console.log(
+        `File ${fileName} uploaded to Streamtape with ID: ${result.id}`
+      );
+
+      res.status(200).json({
+        success: true,
+        message: "Video uploaded successfully!",
+        data: {
+          fileId: result.id,
+          fileName: result.name, // Streamtape's reported name
+          streamUrl: `https://streamtape.com/e/${result.id}`,
+          downloadUrl: result.url,
+          size: result.size,
+          contentType: result.content_type,
+          sha256: result.sha256,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "Error during Streamtape upload process:",
+        error.response?.data || error.message
+      );
+      if (!res.headersSent) {
+        // Prevent setting headers if they've already been sent
+        res.status(500).json({
+          success: false,
+          message: `Failed to upload video: ${
+            error.response?.data?.msg || error.message
+          }`,
+        });
+      }
+    }
+  });
+
+  // Pipe the request into busboy
+  req.pipe(busboy);
 });
 
 // 8. Basic Health Check Route
