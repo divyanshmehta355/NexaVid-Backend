@@ -1,19 +1,19 @@
-// server/index.js - Consolidated and Production-Ready Backend for Render
-
 // 1. Load Environment Variables First
-// This ensures process.env has your sensitive data from the .env file during local development.
-// On Render, these variables are injected directly and this line will still work.
 require("dotenv").config();
 
 // 2. Core Node.js and Express Imports
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
-const axios = require("axios"); // For making HTTP requests to Streamtape API
-// const path = require('path'); // Not needed if not serving static files from backend
+const axios = require("axios");
+const multer = require("multer"); // Re-introducing Multer
+const fs = require("fs"); // For file system operations
+const fsPromises = require("fs/promises"); // For async file deletion
 const morgan = require("morgan");
 const expressStatusMonitor = require("express-status-monitor");
-const Busboy = require("busboy"); // NEW: Import Busboy for stream parsing
+const FormData = require("form-data"); // Needed for both types of uploads now
+const https = require("https"); // Needed for httpsAgent in axios
+const dns = require("dns"); // Optional: Keep if you had DNS issues
 
 const app = express();
 // Use process.env.PORT for Render deployment, fallback to 5000 for local dev
@@ -236,166 +236,285 @@ app.get("/api/videos/:linkId/download-link", async (req, res) => {
   }
 });
 
+// 6. Multer Configuration for LOCAL File Uploads
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      // Use /tmp directory which is ephemeral on Render
+      cb(null, "/tmp/");
+    },
+    filename: (req, file, cb) => {
+      // Generate a unique filename to avoid collisions
+      const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+      cb(
+        null,
+        file.fieldname +
+          "-" +
+          uniqueSuffix +
+          "." +
+          file.originalname.split(".").pop()
+      );
+    },
+  }),
+  limits: {
+    fileSize: 1024 * 1024 * 5000, // 5GB limit (Streamtape's max might be higher)
+  },
+});
+
 // NEW: Handle video uploads to Streamtape using Busboy for direct streaming
 // Handle video uploads to Streamtape using Busboy for direct streaming
-app.post("/api/upload", (req, res) => {
-  const busboy = Busboy({
-    headers: req.headers,
-    highWaterMark: 2 * 1024 * 1024,
-  });
+// NEW: Local File Upload Route (using Multer disk storage)
+app.post("/api/upload", upload.single("videoFile"), async (req, res) => {
+  if (!req.file) {
+    return res
+      .status(400)
+      .json({ success: false, message: "No video file provided." });
+  }
 
-  let fileStream;
-  let fileName = "unknown_file";
+  const tempFilePath = req.file.path; // Path to the temporarily saved file
+  const originalFileName = req.file.originalname;
 
-  busboy.on("file", (fieldname, file, filename, encoding, mimetype) => {
-    if (fieldname !== "videoFile") {
-      file.resume();
-      return;
-    }
+  let fileReadStream; // Declare outside try-finally for scope
 
-    console.log(`Receiving file: ${filename.filename} (${mimetype})`);
-    fileName = filename.filename || "uploaded_video";
-    fileStream = file;
-
-    file.on("error", (err) => {
-      console.error("Error on file stream:", err);
-      if (!res.headersSent) {
-        return res.status(500).json({
-          success: false,
-          message: "File stream error during upload.",
-        });
-      }
+  try {
+    // Step 1: Get an upload URL from Streamtape
+    const initResponse = await axios.get(`${API_BASE_URL}/file/ul`, {
+      params: {
+        login: STREAMTAPE_LOGIN,
+        key: STREAMTAPE_KEY,
+        folder: STREAMTAPE_FOLDER_ID,
+      },
+      timeout: 60000, // 1 minute timeout for this API call
     });
-  });
 
-  busboy.on(
-    "field",
-    (fieldname, val, fieldnameTruncated, valTruncated, encoding, mimetype) => {
-      // console.log(`Field [${fieldname}]: value: ${val}`);
-    }
-  );
-
-  busboy.on("finish", async () => {
-    if (!fileStream) {
-      console.warn("No file stream found in upload request.");
-      if (!res.headersSent) {
-        return res
-          .status(400)
-          .json({ success: false, message: "No file uploaded." });
-      }
-    }
-
-    try {
-      const FormData = require("form-data");
-      const https = require("https");
-      const dns = require("dns");
-      dns.setDefaultResultOrder("ipv4first");
-
-      const initResponse = await axios.get(`${API_BASE_URL}/file/ul`, {
-        params: {
-          login: STREAMTAPE_LOGIN,
-          key: STREAMTAPE_KEY,
-          folder: STREAMTAPE_FOLDER_ID,
-        },
-        timeout: 60000, // NEW: Add timeout for initial URL fetch (1 minute)
-      });
-
-      if (initResponse.data.status !== 200 || !initResponse.data.result?.url) {
-        throw new Error(
-          initResponse.data.msg || "Failed to get upload URL from Streamtape."
-        );
-      }
-
-      const uploadUrl = initResponse.data.result.url;
-      console.log(`Streamtape upload URL obtained: ${uploadUrl}`);
-
-      const form = new FormData();
-      form.append("file1", fileStream, {
-        filename: fileName,
-        contentType: "application/octet-stream",
-      });
-
-      const agent = new https.Agent({
-        keepAlive: true,
-        family: 4,
-      });
-
-      const uploadResponse = await axios.post(uploadUrl, form, {
-        headers: form.getHeaders(),
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-        httpsAgent: agent,
-        timeout: 300000, // NEW: Increased timeout for the actual file upload (5 minutes)
-        onUploadProgress: (progressEvent) => {
-          const percentCompleted = Math.round(
-            (progressEvent.loaded * 100) / progressEvent.total
-          );
-          if (percentCompleted % 10 === 0 || percentCompleted === 100) {
-            console.log(
-              `Upload progress for ${fileName}: ${percentCompleted}%`
-            );
-          }
-        },
-      });
-
-      if (
-        uploadResponse.data.status !== 200 ||
-        !uploadResponse.data.result?.id
-      ) {
-        throw new Error(
-          uploadResponse.data.msg ||
-            "Upload failed or no file ID returned from Streamtape."
-        );
-      }
-
-      const result = uploadResponse.data.result;
-      console.log(
-        `File ${fileName} uploaded to Streamtape with ID: ${result.id}`
+    if (initResponse.data.status !== 200 || !initResponse.data.result?.url) {
+      throw new Error(
+        initResponse.data.msg || "Failed to get upload URL from Streamtape."
       );
+    }
 
+    const uploadUrl = initResponse.data.result.url;
+    console.log(
+      `Streamtape upload URL obtained for ${originalFileName}: ${uploadUrl}`
+    );
+
+    // Step 2: Create a readable stream from the temporary file
+    fileReadStream = fs.createReadStream(tempFilePath);
+
+    const form = new FormData();
+    form.append("file1", fileReadStream, {
+      // Append the stream directly
+      filename: originalFileName,
+      contentType: req.file.mimetype || "application/octet-stream",
+    });
+
+    // Optional: Force IPv4 if you previously had issues, otherwise remove
+    // dns.setDefaultResultOrder("ipv4first");
+    const agent = new https.Agent({
+      keepAlive: true,
+      family: 4,
+    });
+
+    // Step 3: Perform the actual upload to Streamtape by piping the file stream
+    const uploadResponse = await axios.post(uploadUrl, form, {
+      headers: form.getHeaders(),
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      httpsAgent: agent,
+      timeout: 600000, // 10 minutes timeout for the actual file upload
+      onUploadProgress: (progressEvent) => {
+        const percentCompleted = Math.round(
+          (progressEvent.loaded * 100) / progressEvent.total
+        );
+        if (percentCompleted % 10 === 0 || percentCompleted === 100) {
+          console.log(
+            `Upload progress for ${originalFileName}: ${percentCompleted}%`
+          );
+        }
+      },
+    });
+
+    if (uploadResponse.data.status !== 200 || !uploadResponse.data.result?.id) {
+      throw new Error(
+        uploadResponse.data.msg ||
+          "Upload failed or no file ID returned from Streamtape."
+      );
+    }
+
+    const result = uploadResponse.data.result;
+    console.log(
+      `File ${originalFileName} uploaded to Streamtape with ID: ${result.id}`
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Video uploaded successfully!",
+      data: {
+        fileId: result.id,
+        fileName: result.name,
+        streamUrl: `https://streamtape.com/e/${result.id}`,
+        downloadUrl: result.url,
+        size: result.size,
+        contentType: result.content_type,
+        sha256: result.sha256,
+      },
+    });
+  } catch (error) {
+    console.error(
+      "Error during Streamtape upload process for local file:",
+      error.response?.data || error.message,
+      error.stack
+    );
+    if (axios.isCancel(error) || error.code === "ECONNABORTED") {
+      res
+        .status(504)
+        .json({ success: false, message: "Upload to Streamtape timed out." });
+    } else if (error.response && error.response.status) {
+      res.status(error.response.status).json({
+        success: false,
+        message: `Streamtape API error: ${error.response.status} - ${
+          error.response.data?.msg || error.message
+        }`,
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        message: `Server error during upload: ${error.message}`,
+      });
+    }
+  } finally {
+    // Ensure the temporary file is deleted, regardless of success or failure
+    if (tempFilePath) {
+      await fsPromises
+        .unlink(tempFilePath)
+        .then(() => console.log(`Temporary file deleted: ${tempFilePath}`))
+        .catch((unlinkError) =>
+          console.error(
+            `Error deleting temporary file ${tempFilePath}:`,
+            unlinkError
+          )
+        );
+    }
+  }
+});
+
+// Existing: Remote Upload Endpoint (from previous step)
+app.post("/api/remote-upload", async (req, res) => {
+  const { url, name } = req.body;
+
+  if (!url) {
+    return res
+      .status(400)
+      .json({ success: false, message: "Remote URL is required." });
+  }
+
+  try {
+    const streamtapeRemoteDlUrl = `${API_BASE_URL}/remotedl/add`;
+    const params = {
+      login: STREAMTAPE_LOGIN,
+      key: STREAMTAPE_KEY,
+      url: url,
+      folder: STREAMTAPE_FOLDER_ID,
+    };
+
+    if (name) {
+      params.name = name;
+    }
+
+    const response = await axios.get(streamtapeRemoteDlUrl, { params });
+
+    if (response.data.status === 200 && response.data.result) {
+      console.log(
+        `Remote upload initiated for URL: ${url}. Streamtape ID: ${response.data.result.id}`
+      );
       res.status(200).json({
         success: true,
-        message: "Video uploaded successfully!",
-        data: {
-          fileId: result.id,
-          fileName: result.name,
-          streamUrl: `https://streamtape.com/e/${result.id}`,
-          downloadUrl: result.url,
-          size: result.size,
-          contentType: result.content_type,
-          sha256: result.sha256,
-        },
+        message: "Remote upload initiated successfully.",
+        remoteUploadId: response.data.result.id,
+        folderId: response.data.result.folderid,
       });
-    } catch (error) {
-      console.error(
-        "Error during Streamtape upload process:",
-        error.response?.data || error.message
-      );
-      if (!res.headersSent) {
-        // Check for Axios timeout errors specifically
-        if (axios.isCancel(error)) {
-          res
-            .status(504)
-            .json({ success: false, message: "Upload cancelled by timeout." });
-        } else if (error.code === "ECONNABORTED") {
-          res.status(504).json({
-            success: false,
-            message: "Upload timed out after a long wait.",
-          });
-        } else {
-          res.status(500).json({
-            success: false,
-            message: `Failed to upload video: ${
-              error.response?.data?.msg || error.message
-            }`,
-          });
-        }
-      }
+    } else {
+      console.error("Streamtape Remote DL API error (add):", response.data.msg);
+      res.status(response.data.status || 500).json({
+        success: false,
+        message: response.data.msg || "Failed to initiate remote upload.",
+      });
     }
-  });
+  } catch (error) {
+    console.error(
+      "Error initiating remote upload:",
+      error.message,
+      error.stack
+    );
+    res.status(500).json({
+      success: false,
+      message: `Server error initiating remote upload: ${error.message}`,
+    });
+  }
+});
 
-  // Pipe the request into busboy
-  req.pipe(busboy);
+// Existing: Check Remote Upload Status Endpoint
+app.get("/api/remote-upload-status/:id", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const streamtapeRemoteDlStatusUrl = `${API_BASE_URL}/remotedl/status`;
+    const params = {
+      login: STREAMTAPE_LOGIN,
+      key: STREAMTAPE_KEY,
+      id: id,
+    };
+
+    const response = await axios.get(streamtapeRemoteDlStatusUrl, { params });
+
+    if (
+      response.data.status === 200 &&
+      response.data.result &&
+      response.data.result[id]
+    ) {
+      console.log(
+        `Remote upload status for ID ${id}: ${response.data.result[id].status}`
+      );
+      res.status(200).json({
+        success: true,
+        status: response.data.result[id].status,
+        bytesLoaded: response.data.result[id].bytes_loaded,
+        bytesTotal: response.data.result[id].bytes_total,
+        remoteUrl: response.data.result[id].remoteurl,
+        streamtapeUrl: response.data.result[id].url,
+      });
+    } else if (
+      response.data.status === 200 &&
+      response.data.result &&
+      !response.data.result[id]
+    ) {
+      console.warn(`Remote upload ID ${id} not found or no status available.`);
+      res.status(404).json({
+        success: false,
+        message: "Remote upload ID not found or status not yet available.",
+      });
+    } else {
+      console.error(
+        "Streamtape Remote DL API error (status):",
+        response.data.msg
+      );
+      res.status(response.data.status || 500).json({
+        success: false,
+        message:
+          response.data.msg || "Failed to retrieve remote upload status.",
+      });
+    }
+  } catch (error) {
+    console.error(
+      "Error checking remote upload status:",
+      error.message,
+      error.stack
+    );
+    res.status(500).json({
+      success: false,
+      message: `Server error checking remote upload status: ${error.message}`,
+    });
+  }
 });
 
 // 8. Basic Health Check Route
