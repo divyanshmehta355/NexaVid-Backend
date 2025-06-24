@@ -12,10 +12,18 @@ const mongoose = require("mongoose");
 const axios = require("axios"); // For making HTTP requests to Streamtape API
 const multer = require("multer"); // For handling file uploads (multipart/form-data)
 // const path = require('path'); // Not needed if not serving static files from backend
+const morgan = require("morgan");
+const expressStatusMonitor = require("express-status-monitor");
 
 const app = express();
 // Use process.env.PORT for Render deployment, fallback to 5000 for local dev
 const PORT = process.env.PORT || 5000;
+
+// For now, let's keep it simple for immediate access, but keep the security warning in mind:
+app.use(expressStatusMonitor());
+
+// 3. Essential Middleware
+app.use(morgan("combined")); // Request Logging with Morgan (still useful for console logs)
 
 // 3. Essential Middleware
 // CORS: Critical for allowing your frontend (on Cloudflare Pages) to make requests to this backend.
@@ -94,7 +102,7 @@ const API_BASE_URL = "https://api.streamtape.com";
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 1024 * 1024 * 1000, // 1GB limit (adjust as needed, check Streamtape limits)
+    fileSize: 1024 * 1024 * 15000, // 1GB limit (adjust as needed, check Streamtape limits)
   },
 });
 
@@ -117,12 +125,10 @@ app.get("/api/videos", async (req, res) => {
       res.json({ success: true, videos });
     } else {
       console.error("Streamtape API error (listfolder):", response.data.msg);
-      res
-        .status(response.data.status || 500)
-        .json({
-          success: false,
-          message: response.data.msg || "Failed to fetch videos.",
-        });
+      res.status(response.data.status || 500).json({
+        success: false,
+        message: response.data.msg || "Failed to fetch videos.",
+      });
     }
   } catch (error) {
     console.error("Error fetching videos:", error.message);
@@ -146,21 +152,17 @@ app.get("/api/videos/:linkId/thumbnail", async (req, res) => {
         `Streamtape API error (getsplash for ${linkId}):`,
         response.data.msg
       );
-      res
-        .status(response.data.status || 500)
-        .json({
-          success: false,
-          message: response.data.msg || "Failed to get thumbnail.",
-        });
+      res.status(response.data.status || 500).json({
+        success: false,
+        message: response.data.msg || "Failed to get thumbnail.",
+      });
     }
   } catch (error) {
     console.error(`Error fetching thumbnail for ${linkId}:`, error.message);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching thumbnail.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching thumbnail.",
+    });
   }
 });
 
@@ -182,24 +184,20 @@ app.get("/api/videos/:linkId/download-ticket", async (req, res) => {
         `Streamtape API error (dlticket for ${linkId}):`,
         response.data.msg
       );
-      res
-        .status(response.data.status || 500)
-        .json({
-          success: false,
-          message: response.data.msg || "Failed to get download ticket.",
-        });
+      res.status(response.data.status || 500).json({
+        success: false,
+        message: response.data.msg || "Failed to get download ticket.",
+      });
     }
   } catch (error) {
     console.error(
       `Error fetching download ticket for ${linkId}:`,
       error.message
     );
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching download ticket.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching download ticket.",
+    });
   }
 });
 
@@ -233,21 +231,17 @@ app.get("/api/videos/:linkId/download-link", async (req, res) => {
         `Streamtape API error (dl for ${linkId}):`,
         response.data.msg
       );
-      res
-        .status(response.data.status || 500)
-        .json({
-          success: false,
-          message: response.data.msg || "Failed to get download link.",
-        });
+      res.status(response.data.status || 500).json({
+        success: false,
+        message: response.data.msg || "Failed to get download link.",
+      });
     }
   } catch (error) {
     console.error(`Error fetching download link for ${linkId}:`, error.message);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Server error while fetching download link.",
-      });
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching download link.",
+    });
   }
 });
 
@@ -363,6 +357,28 @@ app.post("/api/upload", upload.single("videoFile"), async (req, res) => {
 });
 
 // 8. Basic Health Check Route
+// Health Check Endpoint (still useful for Render's automated health checks)
+app.get("/health", (req, res) => {
+  const dbStatus = mongoose.connection.readyState;
+  const dbMessage = dbStatus === 1 ? "Connected" : "Disconnected";
+  const serverStatus = "OK";
+
+  if (dbStatus === 1) {
+    res.status(200).json({
+      server: serverStatus,
+      database: dbMessage,
+      timestamp: new Date().toISOString(),
+    });
+  } else {
+    res.status(500).json({
+      server: serverStatus,
+      database: dbMessage,
+      timestamp: new Date().toISOString(),
+      error: "Database connection is not healthy",
+    });
+  }
+});
+
 // This route will simply confirm the backend server is running.
 app.get("/", (req, res) => {
   res.send("Seductive Streams Backend API is running!");
@@ -377,4 +393,22 @@ app.listen(PORT, () => {
   } else {
     console.log("Server is running in production mode.");
   }
+});
+
+// Centralized Error Logging for Uncaught Exceptions and Unhandled Rejections (as before)
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION! 🚨 Shutting down...");
+  console.error(err.name, err.message, err.stack);
+  server.close(() => {
+    process.exit(1);
+  });
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("UNHANDLED REJECTION! 🚨 Shutting down...");
+  console.error("Reason:", reason);
+  console.error("Promise:", promise);
+  server.close(() => {
+    process.exit(1);
+  });
 });
