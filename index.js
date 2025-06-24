@@ -237,28 +237,26 @@ app.get("/api/videos/:linkId/download-link", async (req, res) => {
 });
 
 // NEW: Handle video uploads to Streamtape using Busboy for direct streaming
+// Handle video uploads to Streamtape using Busboy for direct streaming
 app.post("/api/upload", (req, res) => {
   const busboy = Busboy({
     headers: req.headers,
     highWaterMark: 2 * 1024 * 1024,
-  }); // 2MB chunk size
+  });
 
   let fileStream;
-  let fileName = "unknown_file"; // Default filename if not provided by client
+  let fileName = "unknown_file";
 
-  // Parse file part
   busboy.on("file", (fieldname, file, filename, encoding, mimetype) => {
     if (fieldname !== "videoFile") {
-      // Ensure it's the field we expect
-      file.resume(); // Ignore other fields
+      file.resume();
       return;
     }
 
     console.log(`Receiving file: ${filename.filename} (${mimetype})`);
     fileName = filename.filename || "uploaded_video";
-    fileStream = file; // Store the file stream
+    fileStream = file;
 
-    // Error handling for the incoming file stream
     file.on("error", (err) => {
       console.error("Error on file stream:", err);
       if (!res.headersSent) {
@@ -270,12 +268,10 @@ app.post("/api/upload", (req, res) => {
     });
   });
 
-  // Parse non-file fields (if any, though not strictly needed for current frontend)
   busboy.on(
     "field",
     (fieldname, val, fieldnameTruncated, valTruncated, encoding, mimetype) => {
       // console.log(`Field [${fieldname}]: value: ${val}`);
-      // You could capture other form fields here if your frontend sends them
     }
   );
 
@@ -295,13 +291,13 @@ app.post("/api/upload", (req, res) => {
       const dns = require("dns");
       dns.setDefaultResultOrder("ipv4first");
 
-      // Step 1: Get an upload URL from Streamtape
       const initResponse = await axios.get(`${API_BASE_URL}/file/ul`, {
         params: {
           login: STREAMTAPE_LOGIN,
           key: STREAMTAPE_KEY,
           folder: STREAMTAPE_FOLDER_ID,
         },
+        timeout: 60000, // NEW: Add timeout for initial URL fetch (1 minute)
       });
 
       if (initResponse.data.status !== 200 || !initResponse.data.result?.url) {
@@ -313,12 +309,10 @@ app.post("/api/upload", (req, res) => {
       const uploadUrl = initResponse.data.result.url;
       console.log(`Streamtape upload URL obtained: ${uploadUrl}`);
 
-      // Step 2: Prepare the file for upload via Form-data and pipe the stream
       const form = new FormData();
       form.append("file1", fileStream, {
-        // Append the stream directly
-        filename: fileName, // Use the captured filename
-        contentType: "application/octet-stream", // Let Streamtape detect or set appropriately
+        filename: fileName,
+        contentType: "application/octet-stream",
       });
 
       const agent = new https.Agent({
@@ -326,20 +320,17 @@ app.post("/api/upload", (req, res) => {
         family: 4,
       });
 
-      // Step 3: Perform the actual upload using axios and the form-data stream
       const uploadResponse = await axios.post(uploadUrl, form, {
-        headers: form.getHeaders(), // Important: Axios needs these headers for stream
+        headers: form.getHeaders(),
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
         httpsAgent: agent,
+        timeout: 300000, // NEW: Increased timeout for the actual file upload (5 minutes)
         onUploadProgress: (progressEvent) => {
           const percentCompleted = Math.round(
             (progressEvent.loaded * 100) / progressEvent.total
           );
-          // You can send progress updates to the client via WebSockets if desired
-          // For now, it's just logged on the server.
-          if (percentCompleted % 10 === 0) {
-            // Log every 10%
+          if (percentCompleted % 10 === 0 || percentCompleted === 100) {
             console.log(
               `Upload progress for ${fileName}: ${percentCompleted}%`
             );
@@ -367,7 +358,7 @@ app.post("/api/upload", (req, res) => {
         message: "Video uploaded successfully!",
         data: {
           fileId: result.id,
-          fileName: result.name, // Streamtape's reported name
+          fileName: result.name,
           streamUrl: `https://streamtape.com/e/${result.id}`,
           downloadUrl: result.url,
           size: result.size,
@@ -381,13 +372,24 @@ app.post("/api/upload", (req, res) => {
         error.response?.data || error.message
       );
       if (!res.headersSent) {
-        // Prevent setting headers if they've already been sent
-        res.status(500).json({
-          success: false,
-          message: `Failed to upload video: ${
-            error.response?.data?.msg || error.message
-          }`,
-        });
+        // Check for Axios timeout errors specifically
+        if (axios.isCancel(error)) {
+          res
+            .status(504)
+            .json({ success: false, message: "Upload cancelled by timeout." });
+        } else if (error.code === "ECONNABORTED") {
+          res.status(504).json({
+            success: false,
+            message: "Upload timed out after a long wait.",
+          });
+        } else {
+          res.status(500).json({
+            success: false,
+            message: `Failed to upload video: ${
+              error.response?.data?.msg || error.message
+            }`,
+          });
+        }
       }
     }
   });
@@ -424,16 +426,26 @@ app.get("/", (req, res) => {
   res.send("Seductive Streams Backend API is running!");
 });
 
-// 9. Start the Server
-app.listen(PORT, () => {
+// 8. Start the Server
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   if (process.env.NODE_ENV !== "production") {
     console.log(`Local API Access: http://localhost:${PORT}/api/videos`);
     console.log(`Local Upload Endpoint: http://localhost:${PORT}/api/upload`);
+    console.log(`Local Health Check: http://localhost:${PORT}/health`);
+    console.log(
+      `Express Monitor Dashboard (requires API Key): http://localhost:${PORT}/status`
+    );
   } else {
     console.log("Server is running in production mode.");
   }
 });
+
+// NEW: Increase server's default timeout (e.g., 5 minutes)
+// This will prevent the Express server from timing out its response to the client
+// while it's waiting for Streamtape to finish the upload.
+server.timeout = 300000; // 5 minutes (in milliseconds)
+// You might also need server.headersTimeout depending on Node.js version and specific network conditions
 
 // Centralized Error Logging for Uncaught Exceptions and Unhandled Rejections (as before)
 process.on("uncaughtException", (err) => {
